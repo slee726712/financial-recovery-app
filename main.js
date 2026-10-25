@@ -5,11 +5,57 @@ const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const configured = Boolean(url && key && /^https:\/\//.test(url));
 const supabase = configured ? createClient(url, key, { auth: { autoRefreshToken: true, persistSession: true, detectSessionInUrl: true } }) : null;
+// Recovery links may establish a session. Keep the recovery form visible until the password changes.
+let recoveryMode = new URLSearchParams(location.hash.slice(1)).get('type') === 'recovery' || new URLSearchParams(location.search).get('type') === 'recovery';
+let recoveryComplete = false;
 const escapeHtml = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money = v => typeof v === 'number' && Number.isFinite(v) ? new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(v) : 'Not verified';
 const shell = body => `<div class="wrap"><header><div class="eyebrow">YOUR PRIVATE SPACE</div><h1>Financial Recovery <span>✳</span></h1><p>Clear decisions. A steadier future.</p></header>${body}<footer>Private beta · Confirmed and projected amounts are always kept separate.</footer></div>`;
 function notice(message, type='info'){const el=app.querySelector('#notice');if(el){el.textContent=message;el.className='notice '+type;}}
 function showAuth(){app.innerHTML=shell(`<section class="card auth"><div class="eyebrow">SECURE ACCESS</div><h2>Welcome back</h2><p>Sign in to view your financial records. No financial information is embedded in this application.</p>${configured?'':`<div class="notice warn">App configuration is not complete. Add the two Vercel environment variables before signing in.</div>`}<form id="login"><label>Email address<input id="email" type="email" autocomplete="email" required placeholder="you@example.com"/></label><label>Password<input id="password" type="password" autocomplete="current-password" minlength="6" required/></label><button ${configured?'':'disabled'} type="submit">Sign in securely</button></form><button class="textbtn" id="reset" ${configured?'':'disabled'} type="button">Email me a password reset link</button><div id="notice" class="notice" role="status" aria-live="polite"></div></section>`);app.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();const email=app.querySelector('#email').value.trim(),password=app.querySelector('#password').value;notice('Signing in…');const {error}=await supabase.auth.signInWithPassword({email,password});if(error)notice(error.message,'warn');});app.querySelector('#reset').addEventListener('click',async()=>{const email=app.querySelector('#email').value.trim();if(!email){notice('Enter your email address first.','warn');return;}const {error}=await supabase.auth.resetPasswordForEmail(email,{redirectTo:location.origin});notice(error?error.message:'If this account exists, a reset email will arrive shortly.',error?'warn':'info');});}
+function showRecovery(){
+  app.innerHTML=shell(`<section class="card auth"><div class="eyebrow">ACCOUNT SECURITY</div><h2>Set a new password</h2><p>Your recovery link was accepted. Choose a new password to finish resetting your account.</p><form id="new-password-form"><label>New password<input id="new-password" type="password" autocomplete="new-password" minlength="12" required placeholder="At least 12 characters"/></label><label>Confirm new password<input id="confirm-password" type="password" autocomplete="new-password" minlength="12" required/></label><button id="save-password" type="submit">Save new password</button></form><div id="notice" class="notice" role="status" aria-live="polite"></div></section>`);
+  app.querySelector('#new-password-form').addEventListener('submit',async e=>{
+    e.preventDefault();
+    const password=app.querySelector('#new-password').value;
+    const confirmation=app.querySelector('#confirm-password').value;
+    if(password.length<12){notice('Use at least 12 characters.','warn');return;}
+    if(password!==confirmation){notice('The passwords do not match.','warn');return;}
+    const button=app.querySelector('#save-password');button.disabled=true;
+    notice('Saving your new password…');
+    try{
+      const {data:{session},error:sessionError}=await supabase.auth.getSession();
+      if(sessionError||!session){notice('This recovery session has expired. Request a new reset link from the sign-in screen.','warn');return;}
+      const {error}=await supabase.auth.updateUser({password});
+      if(error){notice(error.message,'warn');return;}
+      recoveryComplete=true;recoveryMode=false;
+      history.replaceState(null,'',location.pathname);
+      await showDashboard(session);
+      notice('Your password was updated successfully.','info');
+    }catch(err){notice('Could not update your password. Please try again.','warn');}
+    finally{if(button.isConnected)button.disabled=false;}
+  });
+}
 async function showDashboard(session){app.innerHTML=shell(`<div class="topline"><div class="eyebrow">SIGNED IN · ${escapeHtml(session.user.email)}</div><button class="textbtn" id="signout" type="button">Sign out</button></div><div class="grid"><section class="card"><div class="eyebrow">FINANCIAL POSITION</div><h2>Accounts</h2><div id="accounts" class="loading">Loading your private records…</div></section><section class="card"><div class="eyebrow">RECOVERY GUIDANCE</div><h2>Safe to spend</h2><div class="hero">Not established</div><p>Until essential commitments and cleared transactions are reconciled, a positive discretionary balance cannot be verified.</p></section></div><section class="card"><div class="eyebrow">YOUR ACTIVITY</div><h2>Recent transactions</h2><div id="transactions" class="loading">Loading…</div></section><section class="card"><div class="eyebrow">COMING NEXT</div><h2>Your paycheck planner</h2><p>Paycheck allocations, DailyPay exit tracking, bills, debt priorities, and the interactive decision coach will be connected after the database security and import checks.</p></section><div id="notice" class="notice" role="status" aria-live="polite"></div>`);app.querySelector('#signout').addEventListener('click',()=>supabase.auth.signOut());const [a,t]=await Promise.all([supabase.from('financial_accounts').select('id,account_name,account_type,balance,balance_as_of').order('created_at',{ascending:true}).limit(100),supabase.from('financial_transactions').select('id,description,amount,transaction_date,status').order('transaction_date',{ascending:false}).limit(30)]);const ac=app.querySelector('#accounts'),tx=app.querySelector('#transactions');if(a.error){ac.textContent='Could not load accounts: '+a.error.message;}else if(!a.data.length){ac.innerHTML='<p>No accounts imported yet. Your financial records have not been uploaded.</p>';}else{ac.innerHTML=a.data.map(x=>`<div class="item"><div><strong>${escapeHtml(x.account_name)}</strong><small>${escapeHtml(x.account_type)} · As of ${escapeHtml(x.balance_as_of?new Date(x.balance_as_of).toLocaleDateString():'unknown')}</small></div><strong>${money(x.balance===null?null:Number(x.balance))}</strong></div>`).join('');}if(t.error){tx.textContent='Could not load transactions: '+t.error.message;}else if(!t.data.length){tx.innerHTML='<p>No transactions imported yet.</p>';}else{tx.innerHTML=t.data.map(x=>`<div class="item"><div><strong>${escapeHtml(x.description)}</strong><small>${escapeHtml(x.transaction_date)} · ${escapeHtml(x.status)}</small></div><strong>${money(Number(x.amount))}</strong></div>`).join('');}}
-async function start(){if(!configured){showAuth();return;}const {data:{session},error}=await supabase.auth.getSession();if(error){showAuth();notice(error.message,'warn');return;}if(session)await showDashboard(session);else showAuth();supabase.auth.onAuthStateChange((_event,newSession)=>{setTimeout(()=>{if(newSession)showDashboard(newSession);else showAuth();},0);});}
+async function start(){
+  if(!configured){showAuth();return;}
+  // Register before getSession, so the PASSWORD_RECOVERY event is not missed.
+  supabase.auth.onAuthStateChange((event,newSession)=>{
+    if(event==='PASSWORD_RECOVERY') recoveryMode=true;
+    if(recoveryComplete && event==='USER_UPDATED') return;
+    // Supabase recommends deferring asynchronous auth-dependent work from this callback.
+    setTimeout(()=>{
+      if(recoveryComplete && event==='USER_UPDATED') return;
+      if(recoveryMode){showRecovery();return;}
+      if(newSession) showDashboard(newSession);
+      else showAuth();
+    },0);
+  });
+  try{
+    const {data:{session},error}=await supabase.auth.getSession();
+    if(error){showAuth();notice(error.message,'warn');return;}
+    if(recoveryMode){showRecovery();return;}
+    if(session)await showDashboard(session);else showAuth();
+  }catch(err){showAuth();notice('Could not connect to sign-in. Please refresh and try again.','warn');}
+}
 start();
